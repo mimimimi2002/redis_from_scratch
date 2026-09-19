@@ -159,7 +159,7 @@ enum {
   RES_NX = 2,
 };
 
-static std::map<std::string, std::string> g_map;
+static std::unordered_map<std::string, std::string> g_map;
 
 static uint32_t do_get(const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen) {
   if (!g_map.count(cmd[1])) {
