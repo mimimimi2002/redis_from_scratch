@@ -19,6 +19,8 @@
 #include <queue>
 
 #include "list.h"
+#include "thread_pool.h"
+#include "zset.h"
 
 // 内部のメンバへのポインタから、そのメンバを持っている親オブジェクトのポインタを取得する
 #define container_of(ptr, type, member) ({ \
@@ -108,15 +110,6 @@ enum EntryType {
     T_ZSET
 };
 
-struct ZSetItem {
-    std::string member;
-    double score;
-};
-
-struct ZSet {
-    std::vector<ZSetItem> items;
-};
-
 struct Entry {
     EntryType type = T_STRING;
 
@@ -137,6 +130,9 @@ static struct {
   // timers for TTLs
   // using priority queue and hash map and lazy deletion
   std::priority_queue<Timer, std::vector<Timer>, std::greater<Timer>> min_heap;
+
+  // the thread pool
+  ThreadPool tp;
 } g_data;
 
 static bool try_flush_buffer(Conn *conn) {
@@ -274,11 +270,6 @@ static uint32_t do_set(const std::vector<std::string> &cmd, uint8_t *res, uint32
   return RES_OK;
 }
 
-static uint32_t do_del(const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen) {
-  g_data.db.erase(cmd[1]);
-  return RES_OK;
-}
-
 static uint32_t do_expire(const std::vector<std::string> &cmd, uint8_t *res, uint32_t *reslen) {
   if (!g_data.db.count(cmd[1])) {
     return RES_NX;
@@ -346,6 +337,74 @@ static uint32_t do_zrange(const std::vector<std::string> &cmd, uint8_t *res, uin
   memcpy(res, msg.data(), msg.size());
   *reslen = (uint32_t)msg.size();
   return RES_OK;
+}
+
+// should be a long task
+// this time, it just delte the set
+// if set needs free(), the async and thread pool helps
+static void zset_dispose(ZSet *zset) {
+  delete zset;
+}
+
+static void zset_del_async(void *arg) {
+  ZSet *zset = (ZSet *)arg;
+  zset_dispose(zset);
+}
+
+static void entry_del(
+    std::unordered_map<std::string, Entry>::iterator it
+) {
+    Entry &ent = it->second;
+
+    // TTLを解除
+    entry_set_ttl(it->first, ent, -1);
+
+    const size_t k_large_container_size = 10000;
+
+    if (ent.type == T_ZSET) {
+        // zsetのpointerを待避
+        ZSet *zset = ent.zset;
+
+        bool too_big =
+            zset->items.size() > k_large_container_size;
+
+        // 先にkey spaceから切り離す
+        g_data.db.erase(it);
+
+        if (too_big) {
+            // 重いdeleteはworkerへ
+            thread_pool_queue(
+                &g_data.tp,
+                &zset_del_async,
+                zset
+            );
+        } else {
+            // 小さいならmain threadでdelete
+            zset_dispose(zset);
+        }
+
+        return;
+    }
+
+    // STRINGならEntryをeraseするだけで
+    // std::stringも自動的に破棄される
+    g_data.db.erase(it);
+}
+
+static uint32_t do_del(
+    const std::vector<std::string> &cmd,
+    uint8_t *res,
+    uint32_t *reslen
+) {
+    auto it = g_data.db.find(cmd[1]);
+
+    if (it == g_data.db.end()) {
+        return RES_NX;
+    }
+
+    entry_del(it);
+
+    return RES_OK;
 }
 
 
@@ -630,6 +689,9 @@ static void process_timers() {
 int main() {
   // data initialization
   dlist_init(&g_data.idle_list);
+
+  // 4 threads = 4 workers
+  thread_pool_init(&g_data.tp, 4);
 
   // IPv4, stream, protocol
   int fd = socket(AF_INET, SOCK_STREAM, 0);
