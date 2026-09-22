@@ -3,11 +3,98 @@ This is the project of redis implementation from scratch.
 
 This project is based on https://build-your-own.org/redis/.
 
+Each folder is one stage of the same server: from a blocking TCP echo, through `poll()` and Redis-like commands, to TTL timers and a thread pool for expensive cleanup.
+
 # Redis-like Server
 
 A simple Redis-inspired TCP server implemented in C++ to understand how event-driven servers handle multiple client connections using **non-blocking I/O** and `poll()`.
 
-The current implementation works as an **echo server** using a length-prefixed protocol. Each client connection maintains its own read/write buffers and connection state.
+The networking core (see `event_loop/`) is an **echo server** using a length-prefixed protocol. Each client connection maintains its own read/write buffers and connection state. Later folders replace the echo behavior with `SET` / `GET` / `DEL`, idle timeouts, key TTL, sorted sets, and a thread pool.
+
+---
+
+## Folder Structure
+
+```text
+redis_from_scratch/
+├── basic/                      blocking TCP: one client at a time
+├── protocol_parsing/           length-prefixed request / response protocol
+├── event_loop/                 non-blocking I/O + poll() event loop (echo)
+├── command/                    SET / GET / DEL on an in-memory map
+├── fixed_connection_timeout/   idle connection timeout (intrusive linked list)
+├── arbitrary_ttl_timeout/      per-key TTL with a min-heap of timers
+├── thread_pool/                ZADD / ZRANGE + async delete of large zsets
+│   ├── server.cpp
+│   ├── client.cpp
+│   ├── thread_pool.h
+│   ├── thread_pool.cpp
+│   ├── list.h
+│   └── zset.h
+└── README.md
+```
+
+| Folder                       | What it adds                                                |
+| ---------------------------- | ----------------------------------------------------------- |
+| `basic/`                     | `socket` / `bind` / `listen` / `accept`, blocking `read`    |
+| `protocol_parsing/`          | 4-byte length prefix so TCP streams become messages         |
+| `event_loop/`                | `O_NONBLOCK` + `poll()`, one thread serving many clients    |
+| `command/`                   | parse argv-style commands, store strings in a hash map      |
+| `fixed_connection_timeout/`  | close idle connections; doubly linked list of `Conn`        |
+| `arbitrary_ttl_timeout/`     | `pexpire`; min-heap of key timers, lazy deletion            |
+| `thread_pool/`               | `zadd` / `zrange`; worker threads free large zsets off-loop |
+
+---
+
+## Setup
+
+macOS or Linux, with `g++` or `clang++` (C++17). The latest stage also needs POSIX threads.
+
+The server listens on `0.0.0.0:1234`. Stop any previous `./server` on that port before starting a new one.
+
+### Latest stage (`thread_pool/`)
+
+```bash
+cd thread_pool
+
+g++ -std=c++17 -o server server.cpp thread_pool.cpp -pthread
+g++ -std=c++17 -o client client.cpp
+```
+
+Terminal 1:
+
+```bash
+./server
+```
+
+Terminal 2:
+
+```bash
+./client set name Miki
+./client get name
+./client del name
+./client zadd scores 1.0 alice
+./client zrange scores
+./client pexpire name 5000
+```
+
+`thread_pool.cpp` must be linked with the server, and `-pthread` is required for `pthread_create` / mutex / condvar.
+
+### Earlier stages
+
+Compile the `server.cpp` and `client.cpp` in that folder. No extra source file, and no `-pthread`.
+
+```bash
+cd event_loop   # or basic, protocol_parsing, command, ...
+
+g++ -std=c++17 -o server server.cpp
+g++ -std=c++17 -o client client.cpp
+
+./server
+```
+
+`fixed_connection_timeout/` and `arbitrary_ttl_timeout/` only include `list.h`; they still compile as a single `.cpp`.
+
+`basic/` and `protocol_parsing/` use a hardcoded client message. From `command/` onward, the client forwards argv, for example `./client set k v`.
 
 ---
 
@@ -615,42 +702,132 @@ The event loop and non-blocking I/O allow this process to be shared efficiently 
 
 ---
 
+## Thread Pool
+
+The event loop is **single-threaded**. That is the right model for sockets: `poll()`, `read()`, and `write()` stay on one thread so connection state is never shared.
+
+It is the wrong model for a long CPU or allocator burst. If `DEL` frees a huge sorted set on the main thread, `poll()` does not run, and every other client waits.
+
+`thread_pool/` keeps I/O on the event loop and moves **large zset destruction** to worker threads.
+
+### Why a pool, not a new thread per delete
+
+Creating a `pthread` per `DEL` would still work for a toy server. A fixed pool reuses 4 workers, bounds concurrency, and avoids thread-create cost on the hot path.
+
+### Data structures
+
+```cpp
+struct Work {
+    void (*f)(void *) = NULL;
+    void *arg = NULL;
+};
+
+struct ThreadPool {
+    std::vector<pthread_t> threads;
+    std::deque<Work> queue;
+    pthread_mutex_t mu;
+    pthread_cond_t not_empty;
+};
+```
+
+| Piece        | Role                                              |
+| ------------ | ------------------------------------------------- |
+| `threads`    | Worker threads started once in `thread_pool_init` |
+| `queue`      | FIFO of `{function, argument}` jobs               |
+| `mu`         | Protects `queue`                                  |
+| `not_empty`  | Wakes a worker when the producer pushes work      |
+
+The pool is stored on `g_data` next to the hash map and timers. `main()` starts 4 workers before `listen()`:
+
+```cpp
+thread_pool_init(&g_data.tp, 4);
+```
+
+### Producer / consumer
+
+The **event loop is the producer**. Workers are consumers.
+
+```text
+                    Event loop (producer)
+                              |
+                              | thread_pool_queue(f, arg)
+                              v
+                    +-------------------+
+                    |  deque<Work>      |
+                    |  mutex + condvar  |
+                    +---------+---------+
+                              |
+              +---------------+---------------+
+              |               |               |
+              v               v               v
+          Worker 0        Worker 1   ...   Worker 3
+              |               |               |
+              +-------+-------+-------+-------+
+                      |
+                      v
+                 f(arg)   e.g. delete a large ZSet
+```
+
+Producer (`thread_pool_queue`):
+
+1. Lock `mu`.
+2. Push `Work {f, arg}` onto the deque.
+3. `pthread_cond_signal(&not_empty)` so one sleeper wakes.
+4. Unlock.
+
+Consumer (`worker`):
+
+```text
+lock mu
+    while queue is empty:
+        pthread_cond_wait(&not_empty, &mu)   # unlocks, sleeps, relocks
+    pop front Work
+unlock mu
+run w.f(w.arg)
+repeat
+```
+
+`pthread_cond_wait` must sit in a `while`, not an `if`. After a wakeup, another worker may have taken the job, or the wakeup may be spurious. The loop re-checks `queue.empty()` under the mutex.
+
+The worker **unlocks before running `f`**. Holding the mutex during `delete` would serialize every job and stall the producer (the event loop) on `thread_pool_queue`.
+
+### When the server uses it
+
+`entry_del` unlinks the key from `g_data.db` first, so later `GET` / `SET` do not see a half-destroyed entry. Then it decides where to free the zset:
+
+```text
+DEL key
+  |
+  v
+entry_del
+  |
+  | unlink key from g_data.db
+  |
+  +-- zset size <= 10000 --> delete on the event loop
+  |
+  +-- zset size >  10000 --> thread_pool_queue(zset_del_async, zset)
+                                  |
+                                  v
+                             worker: delete zset
+```
+
+Small containers stay on the main thread: queueing would cost more than `delete`. Large ones would stall `poll()`, so they go to the pool.
+
+The payload is only a pointer. The map no longer owns that `ZSet`; the worker is the last owner and calls `zset_dispose`.
+
+This is the same pattern Redis uses for large-object unlink: return to the client quickly, reclaim memory in the background.
+
+---
+
 ## Next Steps
 
-The current server implements the networking foundation.
+The later folders already cover commands, idle timeouts, key TTL, sorted sets, and async delete.
 
-The next step is to replace the echo behavior with Redis-like commands:
+Possible follow-ups:
 
-```text
-SET key value
-GET key
-DEL key
-```
-
-For example:
-
-```text
-Client
-  |
-  | SET name Miki
-  v
-Server
-  |
-  | Parse command
-  | Store value
-  v
-unordered_map
-  |
-  v
-"OK"
-```
-
-Planned improvements:
-
-* `SET`, `GET`, and `DEL` commands
-* In-memory key-value storage
-* TTL expiration
-* Cache eviction
+* Real skip-list / B-tree zset instead of `std::sort` on every `zadd`
+* Cache eviction (maxmemory)
+* A second background job type (not only `delete`)
 * Integration with a web backend
 * Concurrent performance benchmarking
 
